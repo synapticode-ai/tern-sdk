@@ -1,0 +1,52 @@
+# Build
+build/
+dist/
+*.o
+*.so
+*.dylib
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+venv/
+.venv/
+
+# Rust
+target/
+
+# C++
+*.out
+CMakeFiles/
+cmake_install.cmake
+CMakeCache.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Models (never commit model files)
+*.tern-model
+*.onnx
+*.pt
+*.pth
+*.safetensors
+
+# Logs
+*.log
+logs/
+
+# NPU vendor SDKs (install locally)
+vendor-sdk/
