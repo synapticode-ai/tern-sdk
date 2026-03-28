@@ -11,7 +11,9 @@ import uuid
 import threading
 from pathlib import Path
 
-from tern.api.output import TernOutput
+from typing import Generator
+
+from tern.api.output import TernOutput, TernToken
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +224,106 @@ class TernRuntime:
                 pad_token_id=self._tokenizer.pad_token_id,
             )
         return self._tokenizer.decode(output[0], skip_special_tokens=True)
+
+    # ------------------------------------------------------------------
+    # Day 3: stream(), stream_blocking() — streaming inference
+    # ------------------------------------------------------------------
+
+    def stream(
+        self,
+        input: str,
+        max_tokens: int = 256,
+        temperature: float = 0.0,
+        on_token: callable | None = None,
+    ) -> Generator[TernToken, None, None]:
+        """
+        Stream inference token by token.
+
+        Uses PyTorch model for token-by-token generation (CoreML does not
+        support incremental generation natively).
+
+        Example:
+            for token in runtime.stream("Ternary computing is"):
+                print(token.text, end="", flush=True)
+                if token.is_final:
+                    print(f"\\n[{token.position} tokens, {token.latency_ms:.0f}ms/tok]")
+
+        Patent: 27 (NPU orchestration), 28 (deterministic dispatch).
+        """
+        if self._is_unloaded:
+            raise RuntimeError("Runtime has been unloaded. Deploy again to infer.")
+        if self._pytorch_model is None:
+            raise RuntimeError("No PyTorch model available for streaming.")
+
+        import torch
+
+        prompt = input if isinstance(input, str) else str(input)
+        input_ids = self._tokenizer.encode(prompt, return_tensors="pt")
+        sequence = input_ids[0].tolist()           # running list of token ids
+        eos_id = self._tokenizer.eos_token_id
+
+        for pos in range(max_tokens):
+            t0 = time.time()
+
+            input_tensor = torch.tensor([sequence], dtype=torch.long)
+            with torch.no_grad():
+                logits = self._pytorch_model(input_tensor).logits
+
+            # Greedy: argmax of last position
+            next_id = int(torch.argmax(logits[0, -1, :]).item())
+
+            latency_ms = (time.time() - t0) * 1000
+            is_final = (next_id == eos_id) or (pos == max_tokens - 1)
+            decoded = self._tokenizer.decode([next_id], skip_special_tokens=False)
+
+            token = TernToken(
+                text=decoded,
+                token_id=next_id,
+                position=pos,
+                latency_ms=round(latency_ms, 2),
+                is_final=is_final,
+                device=self._device,
+            )
+
+            if on_token is not None:
+                on_token(token)
+
+            yield token
+
+            if next_id == eos_id:
+                break
+
+            sequence.append(next_id)
+
+    def stream_blocking(
+        self,
+        input: str,
+        max_tokens: int = 256,
+        temperature: float = 0.0,
+        progress: bool = True,
+    ) -> TernOutput:
+        """
+        Stream inference and collect into a single TernOutput.
+        Prints progress if progress=True.
+        Returns complete TernOutput when done.
+        """
+        tokens: list[TernToken] = []
+        for tok in self.stream(input, max_tokens, temperature):
+            tokens.append(tok)
+            if progress:
+                print(tok.text, end="", flush=True)
+        if progress:
+            print()
+
+        full_text = "".join(t.text for t in tokens)
+        total_ms = sum(t.latency_ms for t in tokens)
+        return TernOutput(
+            text=full_text,
+            latency_ms=total_ms,
+            device=tokens[-1].device if tokens else "CPU",
+            tokens_per_second=len(tokens) / (total_ms / 1000) if total_ms > 0 else 0,
+            model_id=self._tern_model.model_id,
+        )
 
     # ------------------------------------------------------------------
     # Day 2: swap(), registry(), queue_depth(), extended health()

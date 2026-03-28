@@ -10,6 +10,17 @@ from dataclasses import dataclass
 
 
 @dataclass
+class TernToken:
+    """A single generated token from a streaming inference."""
+    text: str                   # decoded token text
+    token_id: int               # raw token ID
+    position: int               # position in sequence (0-indexed)
+    latency_ms: float           # time to generate this token
+    is_final: bool              # True for last token in sequence
+    device: str                 # "ANE" | "GPU" | "CPU"
+
+
+@dataclass
 class TernOutput:
     """Output from a ternary inference call."""
 
