@@ -1,0 +1,27 @@
+# Copyright 2026 Gamma Seeds Pte Ltd. All rights reserved.
+# Inventor: Robert Lakelin
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tern"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.35.0",
+    "numpy>=1.24.0",
+    "coremltools>=7.0",
+]
+
+[project.scripts]
+tern = "tern.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
