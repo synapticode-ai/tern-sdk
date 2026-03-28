@@ -17,9 +17,11 @@ class TernRuntime:
 
     def __init__(self, tern_model: "TernModel"):
         self._tern_model = tern_model
-        self._loaded_model = None
+        self._coreml_model = None
+        self._pytorch_model = None
         self._tokenizer = None
         self._device = "CPU"
+        self._seq_len = 512
         self._is_healthy = True
         self._is_unloaded = False
         self._load()
@@ -28,34 +30,31 @@ class TernRuntime:
         """Load the model for inference -- CoreML if available, PyTorch fallback."""
         mlpackage_path = Path(self._tern_model.mlpackage_path)
 
-        # Try CoreML first (real .mlpackage from stages 4-5)
-        coreml_loaded = False
-        if mlpackage_path.exists() and not (mlpackage_path / "tern_fallback.json").exists():
+        # Always keep PyTorch model for fallback
+        if getattr(self._tern_model, "_original_model", None) is not None:
+            self._pytorch_model = self._tern_model._original_model
+        else:
             try:
-                import coremltools as ct
-                self._loaded_model = ct.models.MLModel(str(mlpackage_path))
-                self._device = "ANE"
-                coreml_loaded = True
+                import torch
+                from transformers import AutoModelForCausalLM
+                self._pytorch_model = AutoModelForCausalLM.from_pretrained(
+                    self._tern_model.model_id, torch_dtype=torch.float32
+                )
+                self._pytorch_model.eval()
             except Exception:
                 pass
 
-        # Fallback: use original PyTorch model from convert()
-        if not coreml_loaded:
-            if self._tern_model._original_model is not None:
-                self._loaded_model = self._tern_model._original_model
-                self._device = "CPU"
-            else:
-                # Last resort: reload from HuggingFace
-                try:
-                    import torch
-                    from transformers import AutoModelForCausalLM
-                    self._loaded_model = AutoModelForCausalLM.from_pretrained(
-                        self._tern_model.model_id, torch_dtype=torch.float32
-                    )
-                    self._loaded_model.eval()
-                    self._device = "CPU"
-                except Exception:
-                    self._is_healthy = False
+        # Try CoreML (real .mlpackage from stages 4-5)
+        if mlpackage_path.exists() and not (mlpackage_path / "tern_fallback.json").exists():
+            try:
+                import coremltools as ct
+                self._coreml_model = ct.models.MLModel(str(mlpackage_path))
+                self._device = "ANE"
+            except Exception:
+                pass
+
+        if self._coreml_model is None and self._pytorch_model is None:
+            self._is_healthy = False
 
         # Load tokenizer
         try:
@@ -87,12 +86,12 @@ class TernRuntime:
 
         t0 = time.time()
 
-        if self._device == "ANE":
-            # CoreML inference path
+        if self._coreml_model is not None:
             generated_text = self._infer_coreml(prompt, max_tokens)
-        else:
-            # PyTorch fallback
+        elif self._pytorch_model is not None:
             generated_text = self._infer_pytorch(prompt, max_tokens, temperature)
+        else:
+            generated_text = prompt
 
         latency_ms = (time.time() - t0) * 1000
 
@@ -109,15 +108,33 @@ class TernRuntime:
         )
 
     def _infer_coreml(self, prompt: str, max_tokens: int) -> str:
-        """Run inference via CoreML model."""
+        """Run inference via CoreML model. Pads input to fixed sequence length."""
         import numpy as np
-        tokens = self._tokenizer.encode(prompt, return_tensors="np")
-        prediction = self._loaded_model.predict({"input_ids": tokens})
-        # Decode output -- shape depends on model
-        output_ids = prediction.get("logits", prediction.get("output", None))
-        if output_ids is not None:
-            output_ids = np.argmax(output_ids, axis=-1)
-            return self._tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        token_ids = self._tokenizer.encode(prompt)
+        num_tokens = len(token_ids)
+        # Pad to model's fixed sequence length
+        padded = token_ids + [self._tokenizer.pad_token_id or 0] * (self._seq_len - num_tokens)
+        padded = padded[:self._seq_len]
+        input_array = np.array([padded], dtype=np.int32)
+        try:
+            prediction = self._coreml_model.predict({"input_ids": input_array})
+        except RuntimeError:
+            if self._pytorch_model is not None:
+                return self._infer_pytorch(prompt, max_tokens, 0.0)
+            return prompt
+        # Find logits output — may be named "logits", "var_NNN", or "output"
+        output_val = None
+        for key in prediction:
+            val = prediction[key]
+            if isinstance(val, np.ndarray) and val.ndim >= 2:
+                output_val = val
+                break
+        if output_val is not None:
+            # Take logits for the actual token positions (not padding)
+            logits = output_val[0, :num_tokens]
+            next_token = int(np.argmax(logits[-1]))
+            result_ids = token_ids + [next_token]
+            return self._tokenizer.decode(result_ids, skip_special_tokens=True)
         return prompt
 
     def _infer_pytorch(self, prompt: str, max_tokens: int, temperature: float) -> str:
@@ -125,9 +142,9 @@ class TernRuntime:
         import torch
         tokens = self._tokenizer.encode(prompt, return_tensors="pt")
         with torch.no_grad():
-            output = self._loaded_model.generate(
+            output = self._pytorch_model.generate(
                 tokens,
-                max_new_tokens=min(max_tokens, 50),  # limit for speed
+                max_new_tokens=min(max_tokens, 50),
                 do_sample=(temperature > 0),
                 temperature=temperature if temperature > 0 else None,
                 pad_token_id=self._tokenizer.pad_token_id,
@@ -140,14 +157,15 @@ class TernRuntime:
             "is_healthy": self._is_healthy and not self._is_unloaded,
             "device": self._device,
             "model_id": self._tern_model.model_id,
-            "model_loaded": self._loaded_model is not None,
+            "model_loaded": self._coreml_model is not None or self._pytorch_model is not None,
             "tokenizer_loaded": self._tokenizer is not None,
             "stages_completed": self._tern_model.stats.get("stages_completed", []),
         }
 
     def unload(self):
         """Explicitly unload model and free memory."""
-        self._loaded_model = None
+        self._coreml_model = None
+        self._pytorch_model = None
         self._tokenizer = None
         self._is_unloaded = True
         self._is_healthy = False
