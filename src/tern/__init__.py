@@ -15,6 +15,11 @@ Quick start:
 from tern.api.convert import convert, TernModel
 from tern.api.deploy import deploy, TernRuntime
 from tern.api.output import TernOutput, TernToken
+from tern.api.pack import pack, inspect, TernPackage
 
 __version__ = "0.1.0"
-__all__ = ["convert", "deploy", "TernModel", "TernRuntime", "TernOutput", "TernToken"]
+__all__ = [
+    "convert", "deploy", "TernModel", "TernRuntime",
+    "TernOutput", "TernToken",
+    "pack", "inspect", "TernPackage",   # Day 4 additions
+]
